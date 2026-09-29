@@ -2,6 +2,8 @@
 
 Local viewer for saved Jupyter notebook outputs and weekly grades. Runtime uses only the Python standard library; notebooks are displayed, never executed.
 
+![Notebook Grader 批改工作台：學生名冊、分數輸入與 notebook 預覽](docs/assets/notebook-grader.png)
+
 ## Run
 
 Install [uv](https://docs.astral.sh/uv/), then run from this repository:
