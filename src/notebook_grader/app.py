@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlparse
 ROOT = Path(__file__).resolve().parent
 ROSTER_PATH = Path("docs/26_pattern-recognition_students-list.csv")
 HOMEWORK = ROOT / "homework"
-ID_PATTERN = re.compile(r"\b[Dd]\d{7}\b")
+ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])[Dd]\d{7}(?![A-Za-z0-9])")
 
 
 def text(value: object) -> str:
@@ -81,26 +81,34 @@ def save_grade(week: str, student_id: str, score: object, note: object = "", roo
     return grade
 
 
-def path_candidates(path: Path, roster: list[dict[str, str]]) -> set[str]:
-    haystack = str(path).upper()
-    ids = {match.upper() for match in ID_PATTERN.findall(haystack)}
-    candidates = {student["student_id"] for student in roster if student["student_id"].upper() in ids}
-    if candidates:
-        return candidates
-    return {student["student_id"] for student in roster if student["name"] in str(path)}
+def path_candidates(path: Path, roster: list[dict[str, str]], week_root: Path) -> set[str]:
+    ids = {match.upper() for match in ID_PATTERN.findall(str(path.relative_to(week_root)))}
+    return {student["student_id"] for student in roster if student["student_id"].upper() in ids}
 
 
-def notebook_candidates(path: Path, roster: list[dict[str, str]]) -> set[str]:
-    candidates = path_candidates(path, roster)
-    if candidates:
-        return candidates
+def name_candidates(value: str, roster: list[dict[str, str]]) -> set[str]:
+    return {student["student_id"] for student in roster if student["name"] and student["name"] in value}
+
+
+def notebook_candidates(path: Path, roster: list[dict[str, str]], week_root: Path) -> tuple[str | None, set[str], str]:
+    relative = str(path.relative_to(week_root))
+    path_ids = path_candidates(path, roster, week_root)
     try:
         contents = path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         contents = path.read_text(encoding="utf-8-sig")
+    try:
+        contents = str(json.loads(contents))
+    except json.JSONDecodeError:
+        pass
     ids = {match.upper() for match in ID_PATTERN.findall(contents)}
-    candidates = {student["student_id"] for student in roster if student["student_id"].upper() in ids}
-    return candidates or {student["student_id"] for student in roster if student["name"] in contents}
+    content_ids = {student["student_id"] for student in roster if student["student_id"].upper() in ids}
+    candidates = path_ids | content_ids | name_candidates(relative + contents, roster)
+    if len(path_ids) == 1 and not content_ids - path_ids:
+        return next(iter(path_ids)), candidates, "assigned"
+    if path_ids:
+        return None, candidates, "conflict"
+    return None, candidates, "hint" if candidates else "unresolved"
 
 
 def normalize_output(output: dict[str, object]) -> dict[str, object]:
@@ -179,15 +187,22 @@ def week_data(week: str) -> dict[str, object]:
     if Path(week).name != week or not (HOMEWORK / week).is_dir():
         raise ValueError("找不到作業週次")
     roster = load_roster()
-    notebooks = sorted((HOMEWORK / week).rglob("*.ipynb"))
-    files = sorted(path for path in (HOMEWORK / week).rglob("*") if path.is_file())
+    week_root = HOMEWORK / week
+    notebooks = sorted(week_root.rglob("*.ipynb"))
+    files = sorted(path for path in week_root.rglob("*") if path.is_file())
     matches: dict[str, list[Path]] = defaultdict(list)
-    file_candidates: dict[Path, set[str]] = {}
+    evidence: dict[Path, tuple[str | None, set[str], str]] = {}
+    conflicts: set[str] = set()
     for notebook in notebooks:
-        candidates = notebook_candidates(notebook, roster)
-        file_candidates[notebook] = candidates
-        if len(candidates) == 1:
-            matches[next(iter(candidates))].append(notebook)
+        if notebook.name.endswith("_title.ipynb"):
+            evidence[notebook] = None, set(), "reference"
+            continue
+        assigned, candidates, reason = notebook_candidates(notebook, roster, week_root)
+        evidence[notebook] = assigned, candidates, reason
+        if assigned:
+            matches[assigned].append(notebook)
+        elif reason == "conflict":
+            conflicts.update(path_candidates(notebook, roster, week_root))
     grades = load_grades(week)
     students = []
     for student in roster:
@@ -199,7 +214,7 @@ def week_data(week: str) -> dict[str, object]:
             status, path = "multiple", None
             default = "0"
         else:
-            status, path = "unresolved", None
+            status, path = ("conflict" if student["student_id"] in conflicts else "unresolved"), None
             default = "0"
         if path and "error" in read_notebook(path):
             status, default = "invalid", "0"
@@ -217,7 +232,9 @@ def week_data(week: str) -> dict[str, object]:
             {
                 "path": str(path.relative_to(ROOT)),
                 "kind": path.suffix.lower() or "file",
-                "candidates": sorted(file_candidates.get(path, path_candidates(path, roster))),
+                "assigned_id": evidence[path][0] if path in evidence else None,
+                "candidates": sorted(evidence[path][1] if path in evidence else path_candidates(path, roster, week_root) | name_candidates(str(path.relative_to(week_root)), roster)),
+                "reason": evidence[path][2] if path in evidence else "hint",
             }
             for path in files
         ],
@@ -246,10 +263,10 @@ const $=s=>document.querySelector(s);let data,current,currentPath,currentCell=0,
 async function api(path,options){const r=await fetch(path,options),body=await r.json();if(!r.ok)throw Error(body.error);return body}
 function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function markdown(source){let s=esc(source),fenced=false;return s.split('\n').map(line=>{if(line.startsWith('```')){fenced=!fenced;return fenced?'<pre>':'</pre>'}if(fenced)return line+'\n';const m=line.match(/^(#{1,3})\s+(.*)/);if(m)return `<h${m[1].length}>${m[2]}</h${m[1].length}>`;if(line.match(/^[-*]\s+/))return '<div>• '+line.slice(2)+'</div>';return line?'<div>'+line+'</div>':'<br>'}).join('')}
-function status(s){return s.status==='ready'?'已辨識作業':s.status==='multiple'?'多個 notebook，初始 0 分':s.status==='invalid'?'無法解析，初始 0 分':'未辨識作業，初始 0 分'}
+function status(s){return s.status==='ready'?'已辨識作業':s.status==='multiple'?'多個 notebook，待人工確認':s.status==='conflict'?'學號線索衝突，待人工確認':s.status==='invalid'?'無法解析，初始 0 分':'未辨識作業，初始 0 分'}
 function renderStats(){const ready=data.students.filter(s=>s.status==='ready').length,review=data.students.length-ready;$('#stats').innerHTML=`<span class="stat">名冊 <strong>${data.students.length}</strong></span><span class="stat">已辨識 <strong>${ready}</strong></span><span class="stat">待人工 <strong>${review}</strong></span>`}
 function renderStudents(){$('#student-count').textContent=`名冊順序 · ${data.students.length}`;$('#students').innerHTML=data.students.map(s=>`<button class="student ${s.student_id===current?'selected':''}" data-id="${s.student_id}"><span class="student-name">${esc(s.name)}</span><span class="student-score">${esc(s.score)}</span><span class="meta ${s.status==='ready'?'ready':'zero'}">${status(s)}</span></button>`).join('');document.querySelectorAll('.student').forEach(b=>b.onclick=()=>selectStudent(b.dataset.id))}
-function renderFiles(){const groups=new Map;[...data.files].sort((a,b)=>a.path.localeCompare(b.path,'zh-Hant')).forEach(f=>{const dir=f.path.split('/').slice(2,-1).join('/')||'作業說明';if(!groups.has(dir))groups.set(dir,[]);groups.get(dir).push(f)});$('#file-count').textContent=`檔名字母順序 · ${data.files.length}`;$('#files').innerHTML=[...groups].map(([dir,files])=>`<details class="file-group"><summary>${esc(dir)} · ${files.length}</summary>${files.map(f=>{const id=f.candidates.length===1?f.candidates[0]:'';return `<button class="file" data-path="${encodeURIComponent(f.path)}" data-id="${id}"><span class="file-name">${esc(f.path.split('/').pop())}</span><span class="meta">${f.kind}${id?' · '+id:f.candidates.length?' · 無法唯一比對':''}</span></button>`}).join('')}</details>`).join('');document.querySelectorAll('.file').forEach(b=>b.onclick=()=>openFile(decodeURIComponent(b.dataset.path),b.dataset.id))}
+function renderFiles(){const groups=new Map;[...data.files].sort((a,b)=>a.path.localeCompare(b.path,'zh-Hant')).forEach(f=>{const dir=f.path.split('/').slice(2,-1).join('/')||'作業說明';if(!groups.has(dir))groups.set(dir,[]);groups.get(dir).push(f)});$('#file-count').textContent=`檔名字母順序 · ${data.files.length}`;$('#files').innerHTML=[...groups].map(([dir,files])=>`<details class="file-group"><summary>${esc(dir)} · ${files.length}</summary>${files.map(f=>{const id=f.assigned_id&&data.students.find(s=>s.student_id===f.assigned_id)?.status==='ready'?f.assigned_id:'',hints=f.candidates.filter(candidate=>candidate!==f.assigned_id);return `<button class="file" data-path="${encodeURIComponent(f.path)}" data-id="${id}"><span class="file-name">${esc(f.path.split('/').pop())}</span><span class="meta">${esc(f.kind)} · ${f.reason==='reference'?'作業說明':f.reason==='conflict'?'學號衝突，待人工確認':f.assigned_id?(id?'已指派 '+esc(id):'多檔或無法解析，待人工確認'):f.candidates.length?'候選，待人工確認':'未辨識'}${f.assigned_id&&hints.length?' · 線索 '+esc(hints.join(', ')):''}${!f.assigned_id&&f.candidates.length?' · '+esc(f.candidates.join(', ')):''}</span></button>`}).join('')}</details>`).join('');document.querySelectorAll('.file').forEach(b=>b.onclick=()=>openFile(decodeURIComponent(b.dataset.path),b.dataset.id))}
 function markSelection(){const student=[...document.querySelectorAll('.student')].find(b=>b.dataset.id===current);document.querySelectorAll('.student').forEach(b=>b.classList.toggle('selected',b===student));const file=[...document.querySelectorAll('.file')].find(b=>decodeURIComponent(b.dataset.path)===currentPath);document.querySelectorAll('.file').forEach(b=>b.classList.toggle('selected',b===file));if(file)file.closest('details').open=true;requestAnimationFrame(()=>[student,file].filter(Boolean).forEach(item=>{const panel=item.closest('.rail-section'),rect=item.getBoundingClientRect(),box=panel.getBoundingClientRect();panel.scrollTo({top:panel.scrollTop+rect.top-box.top-panel.clientHeight/2+rect.height/2,behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'auto':'smooth'})}))}
 function renderNotebook(notebook){const student=data.students.find(s=>s.student_id===current);currentCell=0;let body='<div class="reader">';if(student)body+=`<section class="reader-head"><div><div class="reader-kicker">正在批改</div><h1>${esc(student.name)} <span>${esc(student.student_id)}</span></h1><p>${status(student)}</p></div><div class="grade-box"><label for="score">總分<input id="score" value="${esc(student.score)}" inputmode="decimal" aria-label="總分"></label><button id="save">儲存 <kbd>Ctrl+S</kbd></button><span id="message" class="message"></span></div></section>`;else body+=`<section class="reader-head"><div><div class="reader-kicker">檔案預覽</div><h1>${esc(notebook.path||'Notebook')}</h1><p>此檔案未對應唯一學生，不能直接寫入成績。</p></div></section>`;if(notebook.error)body+=`<div class="empty"><h2>無法解析 notebook</h2><p>${esc(notebook.error)}</p></div>`;else if(!notebook.cells.length)body+=`<div class="empty"><h2>尚未選定可批改作業</h2><p>此學生的作業無法唯一辨識，初始成績已設為 0。可從右側檔案清單開啟檔案人工覆核。</p></div>`;else{body+=`<nav class="reader-nav" aria-label="Notebook 快捷鍵"><strong id="cell-state">Cell 1 / ${notebook.cells.length}</strong><span class="keymap"><span><kbd>j</kbd>/<kbd>k</kbd> cell</span><span><kbd>gg</kbd>/<kbd>G</kbd> 首尾</span><span><kbd>n</kbd>/<kbd>p</kbd> 學生</span><span><kbd>Ctrl+d</kbd>/<kbd>Ctrl+u</kbd> 捲動</span></nav>`;body+=notebook.cells.map((cell,i)=>`<article class="cell ${i===0?'active':''}" id="cell-${i}" tabindex="-1"><div class="cell-label">${cell.type} · cell ${i+1}</div>${cell.type==='markdown'?`<div class="markdown">${markdown(cell.source)}</div>`:`<pre class="source">${esc(cell.source)}</pre>`}${cell.outputs.map(output=>{let html=`<pre class="output ${output.kind==='error'?'error':''}">${esc(output.text||output.plain||'')}</pre>`;if(output['image/png'])html+=`<img class="image-output" src="data:image/png;base64,${output['image/png']}">`;if(output['image/jpeg'])html+=`<img class="image-output" src="data:image/jpeg;base64,${output['image/jpeg']}">`;if(output['text/html'])html+=`<iframe class="html-output" sandbox srcdoc="${esc(output['text/html'])}"></iframe>`;return html}).join('')}</article>`).join('')}$('#viewer').innerHTML=body+'</div>';if(student){$('#save').onclick=save;$('#score').onkeydown=e=>{if(e.key==='Enter')save()}}}
 function renderNote(note){const head=$('.reader-head');if(!head||!current)return;const field=document.createElement('label'),area=document.createElement('textarea');field.className='note-field';field.textContent='備註';area.id='note';area.rows=2;area.value=note;area.setAttribute('aria-label','備註');field.append(area);head.after(field);if(currentPath){const button=document.createElement('button');button.id='diff-toggle';button.className='diff-toggle';button.type='button';button.innerHTML='比對修改 <kbd>d</kbd>';button.onclick=showDiff;head.querySelector('.grade-box').append(button)}}
